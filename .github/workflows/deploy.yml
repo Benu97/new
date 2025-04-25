@@ -42,4 +42,10 @@ jobs:
             git pull
             npm ci
             npm run build
-            pm2 restart ecosystem.config.cjs 
+            pm2 restart ecosystem.config.cjs
+      
+      - name: Apply Supabase migrations
+        uses: supabase/cli-action@v1
+        with:
+          supabase_db_url: ${{ secrets.SUPABASE_DB_URL }}
+          command: db push 
