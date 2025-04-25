@@ -1,0 +1,231 @@
+# Objective
+Design a **complete development blueprint** for “Costify 2.0” — a modern React/Next.js web-app that lets a catering business owner build ingredient-based recipes, bundle them into packets, apply mark-ups, and generate net/brutto quotes.  
+The output will be passed verbatim into **GPT-4.1 (Cursor agent mode)**, which will generate and iteratively refine the codebase, so the plan must be explicit, deterministic, and broken into small, automatable tasks.
+
+---
+
+## 1 · Context & Constraints  
+- **Frontend**: Next.js (>=14, App Router) with TypeScript.  
+- **Styling/UI**: Tailwind CSS + shadcn/ui (Radix primitives), framer-motion, lucide-react icons.  
+  > If a component is missing in shadcn/ui, suggest Mantine 7 or Ark UI fallbacks and justify.  
+- **State / Data**: TanStack Query for async caching + Zustand for local cart state.  
+- **Backend**: Supabase (project ID: `gugmyndgllbbymrypjpw`). All auth, RLS & RPC via Supabase.  
+- **Hosting**: Hostinger VPS, Ubuntu 24.04, OpenLiteSpeed reverse-proxying a Node.js 20 PM2 process.  
+- **Dev Env** (Cursor MCP servers installed): `filesystem`, `github`, `supabase`, `nodejs`, `21st-dev/magic`, `taskmaster-ai`, `memory`.  
+  > Leverage those in task descriptions (e.g., “supabase exec <SQL>”).  
+
+---
+
+## 2 · High-Level Architecture  
+1. **Next.js Web Tier**  
+   - SSR for dashboard routes, edge-runtime for public quote pages.  
+   - API routes (`/api/*`) proxy Supabase RPC to keep service keys server-side.  
+2. **Supabase**  
+   - **Postgres schema** (see Section 3) with computed columns to auto-calculate recipe & packet costs.  
+   - Postgres functions for cart price breakdown and PDF generation (via `pg_templating`).  
+3. **Client Libraries**  
+   - `@supabase/auth-helpers-nextjs` for session management.  
+   - `@supabase/supabase-js` v2 for data ops.  
+4. **CI/CD**  
+   - GitHub Actions → SSH to VPS, run `pnpm build && pm2 deploy`.  
+   - Supabase migrations auto-applied through `supabase db push`.  
+
+---
+
+## 3 · Database Schema (SQL)  
+```sql
+-- Categories
+CREATE TABLE categories (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL UNIQUE
+);
+
+-- Ingredients
+CREATE TABLE ingredients (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL,
+  price_cents   int  NOT NULL CHECK (price_cents >= 0)
+);
+
+-- Recipes (meals)
+CREATE TABLE recipes (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL,
+  category_id   uuid REFERENCES categories(id) ON DELETE SET NULL
+);
+
+-- Recipe → Ingredient join
+CREATE TABLE recipe_ingredients (
+  recipe_id     uuid REFERENCES recipes(id) ON DELETE CASCADE,
+  ingredient_id uuid REFERENCES ingredients(id) ON DELETE CASCADE,
+  qty           numeric NOT NULL CHECK (qty > 0),
+  PRIMARY KEY (recipe_id, ingredient_id)
+);
+
+-- Packets
+CREATE TABLE packets (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          text NOT NULL,
+  description   text
+);
+
+-- Packet → Recipe join
+CREATE TABLE packet_recipes (
+  packet_id     uuid REFERENCES packets(id) ON DELETE CASCADE,
+  recipe_id     uuid REFERENCES recipes(id) ON DELETE CASCADE,
+  qty           int NOT NULL CHECK (qty > 0),
+  PRIMARY KEY (packet_id, recipe_id)
+);
+
+-- Helper view: recipe_cost_cents
+CREATE VIEW recipe_cost_cents AS
+SELECT
+  r.id,
+  SUM(ri.qty * ing.price_cents)::int AS total_cents
+FROM recipes r
+JOIN recipe_ingredients ri ON ri.recipe_id = r.id
+JOIN ingredients ing       ON ing.id = ri.ingredient_id
+GROUP BY r.id;
+
+-- Helper view: packet_cost_cents
+CREATE VIEW packet_cost_cents AS
+SELECT
+  p.id,
+  SUM(pr.qty * rc.total_cents)::int AS total_cents
+FROM packets p
+JOIN packet_recipes pr ON pr.packet_id = p.id
+JOIN recipe_cost_cents rc ON rc.id = pr.recipe_id
+GROUP BY p.id;
+```
+> Include RLS rules: allow CRUD for authenticated “admin” role; read-only public for others.
+
+---
+
+## 4 · API Design  
+| Route | Method | Auth | Purpose |
+|-------|--------|------|---------|
+| `/api/ingredients` | GET/POST | admin | CRUD ingredients |
+| `/api/recipes`     | GET/POST | admin | CRUD recipes + expand cost view |
+| `/api/packets`     | GET/POST | admin | CRUD packets |
+| `/api/cart/quote`  | POST     | user  | Return net, brutto, avg % for arbitrary cart payload |
+
+Implementation: thin Next.js handlers calling Supabase RPCs, returning typed `zod`-validated DTOs.
+
+---
+
+## 5 · Frontend Component Map  
+```
+app/
+ ├─ (marketing)
+ ├─ dashboard/
+ │   ├─ ingredients/
+ │   ├─ recipes/
+ │   ├─ packets/
+ │   └─ quotes/          # shopping-cart view
+ ├─ components/
+ │   ├─ ui/              # shadcn wrapped components
+ │   ├─ CartProvider.tsx
+ │   └─ ...
+ └─ lib/
+     ├─ supabase.ts
+     ├─ queries.ts        # TanStack Query hooks
+     └─ pricing.ts        # pure functions for % markup
+```
+
+---
+
+## 6 · UI/UX & Animation Guidelines  
+- Dark mode default; respect `prefers-color-scheme`.  
+- Use **framer-motion** for tab / modal transitions, **radix-tooltip** for packet badges.  
+- Keep animations sub-250 ms; avoid layout shift.  
+- Follow WCAG 2.2 AA: focus rings, aria-labels, keyboard nav.
+
+---
+
+## 7 · State & Data Flow  
+1. Supabase → TanStack Query cache → Components.  
+2. **CartProvider** (Zustand) stores local cart, syncs to `localStorage`.  
+3. Derived selectors compute net/brutto on the fly.
+
+---
+
+## 8 · Edge Logic  
+- **Custom packet**: deep-clone packet_recipes client-side, allow +/– adjustments, label as “custom”.  
+- **% Mark-up**: per-item override; compute average % across cart for display & PDF.
+
+---
+
+## 9 · Third-Party Libraries  
+| Purpose | Library | Reason |
+|---------|---------|--------|
+| UI primitives | **shadcn/ui (Radix)** | accessible, themeable |
+| Icons | **lucide-react** | consistent stroke icons |
+| Animations | **framer-motion** | physics-based, SSR-safe |
+| Styling | **Tailwind CSS** | utility-first, integrates with shadcn |
+| Form validation | **react-hook-form** + **zod** | type-safe |
+| PDF export | **pdfmake** on server | SSR-friendly |
+| Testing | **Playwright**, **Jest** | e2e + unit |
+| Lint/Format | **ESLint**, **Prettier** | code quality |
+
+---
+
+## 10 · DevOps & Deployment  
+1. **Provision VPS**  
+   - `ufw allow 80 443 22 3000`  
+   - Install Node 20, pnpm, PM2, Nginx → OpenLiteSpeed.  
+2. **Build & Deploy**  
+   ```bash
+   pnpm install
+   pnpm run build
+   PM2 restart ecosystem.config.cjs
+   ```  
+3. **CI**: GitHub Action triggers on `main`, runs tests, then SSH deploy.  
+4. Include **supabase migration** step in pipeline.
+
+---
+
+## 11 · Testing Strategy  
+- Unit: price calculation, % markup edge cases.  
+- Integration: Supabase RPCs via `@supabase/testing`.  
+- e2e: Add packet → customise → export PDF.  
+- Use Playwright’s trace viewer in CI.
+
+---
+
+## 12 · Accessibility & Performance  
+- Lighthouse score ≥ 95.  
+- Lazy-load image assets, dynamic imports for admin pages.  
+- Use Content-Security-Policy headers via `next.config.js`.
+
+---
+
+## 13 · Development Roadmap (hand-off friendly)  
+| Phase | Task (atomic) | Cursor MCP to use |
+|-------|---------------|-------------------|
+| 0 | `supabase exec` schema SQL | `supabase` |
+| 1 | `npx create-next-app costify --ts` | `filesystem` |
+| 2 | Tailwind + shadcn init | `nodejs` |
+| 3 | Scaffold pages/components | `taskmaster-ai` |
+| 4 | TanStack Query hooks | – |
+| 5 | CartProvider with Zustand | – |
+| 6 | API route stubs | – |
+| 7 | CI/CD workflow YAML | `github` |
+| 8 | Playwright tests | – |
+| 9 | PM2 ecosystem file + deploy script | `filesystem` |
+|10 | Polish animations, a11y audit | `21st-dev/magic` |
+
+---
+
+## 14 · Risk Register & Mitigations  
+- **RLS mistakes** → write integration tests hitting protected rows.  
+- **Currency rounding** → store prices in **integer cents** only.  
+- **Large packet customisation diff** → debounce state updates and memoise totals.  
+
+---
+
+### Deliverable Format
+Return a **Markdown document** with the above sections **populated in depth**, including:
+- Supabase SQL code-blocks ready to run.
+- File/folder tree snippets.
+- Inline rationale for every tech choice.
+- Bullet-proof step-by-step checklist so GPT-4.1 (Cursor) can implement autonomously.
